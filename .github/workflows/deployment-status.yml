@@ -1,0 +1,251 @@
+name: Deployment Status
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  pre-deployment:
+    name: pre-deployment
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 # Get previous commit
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run lint
+        run: npm run lint
+
+      - name: Run tests
+        run: npm test
+
+      - name: Get previous commit SHA
+        id: prev-commit
+        run: echo "prev_sha=$(git rev-parse HEAD~1)" >> $GITHUB_OUTPUT
+
+      - name: Get package version
+        id: package-version
+        run: echo "version=$(jq -r .version package.json)" >> $GITHUB_OUTPUT
+
+      - name: Create deployment tracking issue
+        id: create-issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: issue } = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Deployment Tracking - ${context.sha}`,
+              labels: ['deployment', 'in-progress'],
+              body: `Deployment started for commit ${context.sha}\nPrevious Commit: ${{ steps.prev-commit.outputs.prev_sha }}\nPackage Version: ${{ steps.package-version.outputs.version }}`
+            });
+            return issue.number;
+
+      - name: Post pre-deployment comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ steps.create-issue.outputs.result }},
+              body: "Pre-deployment checks completed"
+            });
+
+  rollback-preparation:
+    name: rollback-preparation
+    needs: pre-deployment
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Get previous commit SHA
+        id: prev-commit
+        run: echo "prev_sha=$(git rev-parse HEAD~1)" >> $GITHUB_OUTPUT
+
+      - name: Get package version
+        id: package-version
+        run: echo "version=$(jq -r .version package.json)" >> $GITHUB_OUTPUT
+
+      - name: Create rollback script
+        run: |
+          cat > rollback.sh << 'EOF'
+          #!/bin/bash
+          set -euo pipefail
+
+          echo "Starting rollback to previous commit..."
+          git checkout ${{ steps.prev-commit.outputs.prev_sha }}
+          npm ci
+          echo "Rollback completed successfully"
+          EOF
+          chmod +x rollback.sh
+
+      - name: Create configuration backups
+        run: |
+          mkdir -p rollback-backups
+          cp package.json rollback-backups/
+          cp package-lock.json rollback-backups/
+          cp -r .env.example rollback-backups/ || echo "No .env.example found"
+
+      - name: Create dependency verification script
+        run: |
+          cat > verify-dependencies.sh << 'EOF'
+          #!/bin/bash
+          npm ls --depth=0
+          EOF
+          chmod +x verify-dependencies.sh
+
+      - name: Create rollback documentation
+        run: |
+          cat > rollback-docs.md << 'EOF'
+          # Rollback Instructions
+
+          ## Step 1: Stop application
+          sudo systemctl stop mcpmark-cicd
+
+          ## Step 2: Run rollback script
+          ./rollback.sh
+
+          ## Step 3: Verify dependencies
+          ./verify-dependencies.sh
+
+          ## Step 4: Start application
+          sudo systemctl start mcpmark-cicd
+
+          ## Step 5: Verify deployment
+          curl http://localhost:3000/health
+          EOF
+
+      - name: Create compressed rollback package
+        run: |
+          tar -czf rollback-package-${{ github.sha }}.tar.gz rollback.sh verify-dependencies.sh rollback-docs.md rollback-backups/
+          sha256sum rollback-package-${{ github.sha }}.tar.gz > rollback-package-${{ github.sha }}.sha256
+
+      - name: Upload rollback artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-package-${{ github.sha }}
+          path: |
+            rollback-package-${{ github.sha }}.tar.gz
+            rollback-package-${{ github.sha }}.sha256
+          retention-days: 30
+
+      - name: Get deployment issue number
+        id: get-issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'deployment,in-progress',
+              state: 'open'
+            });
+            return issues[0].number;
+
+      - name: Post rollback plan comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const checksum = require('fs').readFileSync('rollback-package-${{ github.sha }}.sha256', 'utf8').split(' ')[0];
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ steps.get-issue.outputs.result }},
+              body: `# 🔄 Rollback Plan Ready
+
+              Previous Commit: ${{ steps.prev-commit.outputs.prev_sha }}
+              Current Commit: ${{ github.sha }}
+              Package Version: ${{ steps.package-version.outputs.version }}
+              Artifact: rollback-package-${{ github.sha }}
+
+              ✅ Rollback script created
+              ✅ Configuration backup completed
+              ✅ Dependency verification script created
+              ✅ Rollback documentation created
+              ✅ Compressed rollback package created
+
+              ## Quick Rollback Command
+              \`\`\`bash
+              ./rollback.sh
+              \`\`\`
+
+              Rollback script created: true
+              Configuration backup: true
+              SHA256: ${checksum}
+              `
+            });
+
+  post-deployment:
+    name: post-deployment
+    needs: rollback-preparation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get deployment issue number
+        id: get-issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'deployment,in-progress',
+              state: 'open'
+            });
+            return issues[0].number;
+
+      - name: Update issue labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.removeLabel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ steps.get-issue.outputs.result }},
+              name: 'in-progress'
+            });
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ steps.get-issue.outputs.result }},
+              labels: ['completed']
+            });
+
+      - name: Post final comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ steps.get-issue.outputs.result }},
+              body: `Deployment Completed Successfully
+
+              Rollback artifact: rollback-package-${{ github.sha }}
+              `
+            });
+
+      - name: Close deployment issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ steps.get-issue.outputs.result }},
+              state: 'closed'
+            });
